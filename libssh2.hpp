@@ -131,6 +131,36 @@ namespace libssh2
                 throw e;
             }
         }
+
+        void execute(const char *command) {
+            int rc = libssh2_channel_exec(this->_chan, command);
+            if( rc != 0 ) {
+                std::stringstream s;
+                s << "libssh2_channel_exec() error, code: " << rc;
+                exception e(s.str());
+                throw e;
+            }
+
+            do {
+                char buffer[0x4000];
+                rc = libssh2_channel_read(this->_chan, buffer, sizeof(buffer));
+                for(int i=0; i < rc; ++i) fputc(buffer[i], stdout);
+            } while(rc > 0);
+        }
+
+        ssize_t write(const char *buf, size_t buflen) {
+            printf("libssh2 channel:%p\n", this->_chan);
+            return libssh2_channel_write(this->_chan, buf, buflen);
+        }
+
+        ssize_t read(char *buf, size_t buflen) {
+            return libssh2_channel_read(this->_chan, buf, buflen);
+        }
+
+        int eof() {
+            return libssh2_channel_eof(this->_chan);
+        }
+
         ~channel()
         {
             libssh2_channel_free(this->_chan);
@@ -144,6 +174,102 @@ namespace libssh2
         LIBSSH2_CHANNEL* _chan;
     };
     
+    /*
+     * sftp
+     */
+    class sftp
+    {
+        friend class session;
+        public:
+            virtual ~sftp() {
+                libssh2_sftp_shutdown(_sftp);
+            }
+
+            void get(const char *remotepath, const char *localpath) {
+                LIBSSH2_SFTP_HANDLE *sftp_handle;
+                sftp_handle = libssh2_sftp_open(_sftp, remotepath, LIBSSH2_FXF_READ, 0);
+                if (!sftp_handle) {
+                    std::stringstream s;
+                    s << "Unable to open file with SFTP: " << strerror(libssh2_sftp_last_error(_sftp));
+                    exception e(s.str());
+                    throw e;
+                }
+
+                FILE *fp = fopen(localpath, "wb");
+                if (!fp) {
+                    std::stringstream s;
+                    s << "Can't open local file: " << localpath;
+                    exception e(s.str());
+                    throw e;
+                }
+
+                do {
+                    char mem[1024];
+                    int rc = libssh2_sftp_read(sftp_handle, mem, sizeof(mem));
+
+                    if (rc > 0) {
+                        fwrite(mem, 1, rc, fp);
+                    } else {
+                        break;
+                    }
+                } while (1);
+
+                fclose(fp);
+                libssh2_sftp_close(sftp_handle);
+            }
+
+            void put(const char *localpath, const char *remotepath) {
+                LIBSSH2_SFTP_HANDLE *sftp_handle = 
+                    libssh2_sftp_open(_sftp, remotepath,
+                            LIBSSH2_FXF_WRITE|LIBSSH2_FXF_CREAT|LIBSSH2_FXF_TRUNC,
+                            LIBSSH2_SFTP_S_IRUSR|LIBSSH2_SFTP_S_IWUSR|
+                            LIBSSH2_SFTP_S_IRGRP|LIBSSH2_SFTP_S_IROTH);
+                if (!sftp_handle) {
+                    std::stringstream s;
+                    s << "Unable to open file with SFTP: " << remotepath;
+                    exception e(s.str());
+                    throw e;
+                }
+
+                FILE *fp = fopen(localpath, "rb");
+                if (!fp) {
+                    std::stringstream s;
+                    s << "Can't open local file: " << localpath;
+                    exception e(s.str());
+                    throw e;
+                }
+
+                int rc;
+                char mem[1024*100];
+                size_t nread;
+                char *ptr;
+                do {
+                    nread = fread(mem, 1, sizeof(mem), fp);
+                    if (nread <= 0) {
+                        /* end of file */ 
+                        break;
+                    }
+                    ptr = mem;
+                    do {
+                        /* write data in a loop until we block */ 
+                        rc = libssh2_sftp_write(sftp_handle, ptr, nread);
+                        if(rc < 0)
+                            break;
+                        ptr += rc;
+                        nread -= rc;
+                    } while (nread);
+                } while (rc > 0);
+
+                fclose(fp);
+                libssh2_sftp_close(sftp_handle);
+            }
+        private:
+            sftp(LIBSSH2_SFTP *s) {
+                _sftp = s;
+            }
+
+            LIBSSH2_SFTP * _sftp;
+    };
     
     class fingerprint
     {
@@ -299,10 +425,12 @@ namespace libssh2
                 types |= auth_methods::KEYS;
             }
         }
+
         fingerprint get_host_fingerprint()
         {
             return fingerprint(this->_sess);
         }
+
         void auth_password(std::string username, std::string password) throw(authentication_exception)
         {
             // TODO Check the return value for the specific error.
@@ -324,6 +452,35 @@ namespace libssh2
             channel* c = new channel(_chan);
             return c;
         }
+
+        channel* open_tunnel(const char *remotehost, int remoteport)
+        {
+            LIBSSH2_CHANNEL* _chan;
+            _chan = libssh2_channel_direct_tcpip(this->_sess, remotehost, remoteport);
+            if (!_chan) {
+                exception e("Could not open the direct-tcpip channel!\n"
+                        "(Note that this can be a problem at the server!"
+                        " Please review the server logs.)");
+                throw e;
+            }
+            //libssh2_session_set_blocking(this->_sess, 0);
+            printf("libssh2 channel 111:%p\n", _chan);
+            channel* c = new channel(_chan);
+            return c;
+        }
+
+        sftp* open_sftp()
+        {
+            LIBSSH2_SFTP *sftp_session;
+            sftp_session = libssh2_sftp_init(this->_sess);
+            if (!sftp_session) {
+                exception e("Unable to init SFTP session");
+                throw e;
+            }
+            sftp* s = new sftp(sftp_session);
+            return s;
+        }
+
         virtual ~session()
         {
             // TODO Make sure the session is shut down and channels are closed
@@ -365,4 +522,5 @@ namespace libssh2
             }
         }
     };
+
 }
